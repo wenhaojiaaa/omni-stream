@@ -42,6 +42,9 @@ impl DatasetStore {
   }
 
   fn key(&self, path: &Path) -> Result<String> {
+    if path.as_ref() == "selected-file" {
+      return Ok(self.root.clone());
+    }
     let suffix = path
       .as_ref()
       .strip_prefix("dataset/")

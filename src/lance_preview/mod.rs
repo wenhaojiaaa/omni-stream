@@ -7,8 +7,15 @@ use axum::{
   http::header,
   response::{IntoResponse, Response},
 };
+use futures::{StreamExt, TryStreamExt, stream};
 use lance::{dataset::builder::DatasetBuilder, session::Session};
-use lance_io::object_store::ObjectStoreRegistry;
+use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_io::{
+  ReadBatchParams,
+  object_store::{ObjectStoreProvider, ObjectStoreRegistry},
+  scheduler::{ScanScheduler, SchedulerConfig},
+  utils::CachedFileSize,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -46,7 +53,10 @@ impl Write for PageBuffer {
 
 #[derive(Serialize)]
 struct DatasetPage {
-  version: u64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  version: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  file_format: Option<String>,
   total: usize,
   offset: usize,
   columns: Vec<Column>,
@@ -63,6 +73,8 @@ struct Column {
 
 #[derive(Deserialize)]
 pub struct PageQuery {
+  #[serde(default)]
+  physical: bool,
   storage: Option<String>,
   #[serde(default)]
   offset: usize,
@@ -132,42 +144,95 @@ async fn page(
     return Err(AppError::InvalidRange("limit must be 1..20".into()));
   }
 
-  // A missing versions directory identifies an ordinary folder. Preserve all
-  // subsequent errors (missing fragments, stale snapshots, corrupt manifests).
-  if query.version.is_none() {
-    backend
-      .check_read_scope(root, &format!("{root}/_versions"))
-      .await?;
-    let versions = backend
-      .list_files(&format!("{root}/_versions/"), None)
-      .await?;
-    if versions.entries.is_empty() {
-      return Err(AppError::NotFound("Lance versions directory".into()));
+  enum Source {
+    Dataset(Box<lance::Dataset>),
+    File(FileReader),
+  }
+  let store = Arc::new(store::DatasetStore::new(backend.clone(), root));
+  let source = if query.physical {
+    if query.version.is_some() {
+      return Err(AppError::Unsupported(
+        "physical files have no snapshot version".into(),
+      ));
     }
-  }
+    let virtual_uri =
+      url::Url::parse("memory:///selected-file").map_err(|e| AppError::Backend(e.to_string()))?;
+    let object_store = store
+      .new_store(virtual_uri, &Default::default())
+      .await
+      .map_err(dataset_error)?;
+    let scheduler = ScanScheduler::new(Arc::new(object_store), SchedulerConfig::new(4 << 20));
+    let file = scheduler
+      .open_file(
+        &object_store::path::Path::from("selected-file"),
+        &CachedFileSize::unknown(),
+      )
+      .await
+      .map_err(dataset_error)?;
+    let reader = FileReader::try_open(
+      file,
+      None,
+      Default::default(),
+      &lance::cache::LanceCache::no_cache(),
+      FileReaderOptions {
+        batch_size_bytes: Some(DISPLAY_BYTES as u64),
+        ..Default::default()
+      },
+    )
+    .await
+    .map_err(dataset_error)?;
+    Source::File(reader)
+  } else {
+    // A missing versions directory identifies an ordinary folder. Preserve all
+    // subsequent errors (missing fragments, stale snapshots, corrupt manifests).
+    if query.version.is_none() {
+      backend
+        .check_read_scope(root, &format!("{root}/_versions"))
+        .await?;
+      let versions = backend
+        .list_files(&format!("{root}/_versions/"), None)
+        .await?;
+      if versions.entries.is_empty() {
+        return Err(AppError::NotFound("Lance versions directory".into()));
+      }
+    }
 
-  let registry = Arc::new(ObjectStoreRegistry::empty());
-  let store = Arc::new(store::DatasetStore::new(backend, root));
-  registry.insert("memory", store.clone());
-  let session = Arc::new(Session::new(0, 2 << 20, registry));
-  let mut builder = DatasetBuilder::from_uri("memory:///dataset").with_session(session);
-  if let Some(version) = query.version {
-    builder = builder.with_version(version);
-  }
-  let ds = builder.load().await.map_err(dataset_error)?;
-  if !ds.manifest().base_paths.is_empty() {
-    return Err(AppError::Unsupported("external Lance base paths".into()));
-  }
-  let total = ds.count_rows(None).await.map_err(dataset_error)?;
+    let registry = Arc::new(ObjectStoreRegistry::empty());
+    registry.insert("memory", store.clone());
+    let session = Arc::new(Session::new(0, 2 << 20, registry));
+    let mut builder = DatasetBuilder::from_uri("memory:///dataset").with_session(session);
+    if let Some(version) = query.version {
+      builder = builder.with_version(version);
+    }
+    let ds = builder.load().await.map_err(dataset_error)?;
+    if !ds.manifest().base_paths.is_empty() {
+      return Err(AppError::Unsupported("external Lance base paths".into()));
+    }
+    Source::Dataset(Box::new(ds))
+  };
+  let (schema, total, version, file_format) = match &source {
+    Source::File(f) => (
+      f.schema().as_ref(),
+      usize::try_from(f.num_rows())
+        .map_err(|_| AppError::Unsupported("file row count too large".into()))?,
+      None,
+      Some(f.version().to_string()),
+    ),
+    Source::Dataset(ds) => (
+      ds.schema(),
+      ds.count_rows(None).await.map_err(dataset_error)?,
+      Some(ds.version().version),
+      None,
+    ),
+  };
   if query.offset > total {
     return Err(AppError::InvalidRange(
       "offset exceeds dataset row count".into(),
     ));
   }
-  let mut projection = ds.schema().clone();
+  let mut projection = schema.clone();
   projection.fields.retain(|f| projected(&f.data_type()));
-  let columns: Vec<_> = ds
-    .schema()
+  let columns: Vec<_> = schema
     .fields
     .iter()
     .map(|field| {
@@ -179,22 +244,51 @@ async fn page(
       }
     })
     .collect();
-  let indices: Vec<_> = (query.offset..query.offset.saturating_add(limit).min(total))
-    .map(|i| i as u64)
-    .collect();
-  let mut rows: Vec<Value> = if indices.is_empty() || projection.fields.is_empty() {
-    vec![json!({}); indices.len()]
+  let range = query.offset..query.offset.saturating_add(limit).min(total);
+  let mut rows: Vec<Value> = if range.is_empty() || projection.fields.is_empty() {
+    vec![json!({}); range.len()]
   } else {
-    let batch = ds.take(&indices, projection).await.map_err(dataset_error)?;
-    if batch.get_array_memory_size() > DISPLAY_BYTES {
-      return Err(AppError::Unsupported(
-        "Lance page exceeds the display budget".into(),
-      ));
-    }
+    let mut batches = match &source {
+      Source::Dataset(ds) => {
+        let indices = range.map(|i| i as u64).collect::<Vec<_>>();
+        let batch = ds.take(&indices, projection).await.map_err(dataset_error)?;
+        stream::once(async { Ok(batch) }).boxed()
+      }
+      Source::File(f) => {
+        let names = projection
+          .fields
+          .iter()
+          .map(|v| v.name.as_str())
+          .collect::<Vec<_>>();
+        let projection =
+          lance_file::versions::reader_projection_from_column_names(f.version(), schema, &names)
+            .map_err(dataset_error)?;
+        f.read_stream_projected(
+          ReadBatchParams::Range(range),
+          limit as u32,
+          1,
+          projection,
+          lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await
+        .map_err(dataset_error)?
+        .map_err(|e| AppError::Unsupported(e.to_string()))
+        .boxed()
+      }
+    };
     let mut writer = arrow_json::ArrayWriter::new(PageBuffer::default());
+    while let Some(batch) = batches.try_next().await? {
+      if batch.get_array_memory_size() > DISPLAY_BYTES {
+        return Err(AppError::Unsupported(
+          "Lance page exceeds the display budget".into(),
+        ));
+      }
+      writer
+        .write(&batch)
+        .map_err(|e| AppError::Unsupported(e.to_string()))?;
+    }
     writer
-      .write(&batch)
-      .and_then(|()| writer.finish())
+      .finish()
       .map_err(|e| AppError::Unsupported(e.to_string()))?;
     serde_json::from_slice(&writer.into_inner().0).map_err(|e| AppError::Backend(e.to_string()))?
   };
@@ -213,7 +307,8 @@ async fn page(
     "read Lance page"
   );
   Ok(DatasetPage {
-    version: ds.version().version,
+    version,
+    file_format,
     total,
     offset: query.offset,
     columns,
@@ -240,7 +335,7 @@ fn preserve_integer_precision(value: &mut Value) {
 mod tests {
   use super::*;
   #[tokio::test]
-  async fn reads_last_page_through_storage_and_preserves_large_integers() {
+  async fn file_keeps_deleted_rows_and_dataset_respects_snapshot() {
     use crate::storage::local::LocalFsBackend;
     let dir = tempfile::tempdir().unwrap();
     let dataset = dir.path().join("fixture.lance");
@@ -251,19 +346,53 @@ mod tests {
         b"{\"id\":1}\n{\"id\":9007199254740993}\n",
       ))
       .unwrap();
-    lance::Dataset::write(reader, dataset.to_str().unwrap(), None)
+    let mut ds = lance::Dataset::write(reader, dataset.to_str().unwrap(), None)
       .await
       .unwrap();
     let storage = Arc::new(LocalFsBackend::new(dir.path(), false));
     let query = PageQuery {
+      physical: false,
       storage: None,
       offset: 1,
       limit: Some(20),
       version: Some(1),
     };
-    let result = page(storage, "fixture.lance/", query).await.unwrap();
+    let result = page(storage.clone(), "fixture.lance/", query)
+      .await
+      .unwrap();
     assert_eq!(result.total, 2);
     assert_eq!(result.rows, vec![json!({"id":"9007199254740993"})]);
+    let file = format!(
+      "fixture.lance/data/{}",
+      ds.get_fragments()[0].metadata().files[0].path
+    );
+    ds.delete("id = 1").await.unwrap();
+    let query = |physical| PageQuery {
+      storage: None,
+      offset: 0,
+      limit: None,
+      version: None,
+      physical,
+    };
+    let snapshot = page(storage.clone(), "fixture.lance", query(false))
+      .await
+      .unwrap();
+    assert_eq!(snapshot.total, 1);
+    assert_eq!(snapshot.version, Some(2));
+    assert_eq!(snapshot.rows, result.rows);
+    let physical = page(storage.clone(), &file, query(true)).await.unwrap();
+    assert_eq!(physical.total, 2);
+    assert!(physical.version.is_none());
+    assert!(physical.file_format.is_some());
+    assert_eq!(
+      physical.rows,
+      vec![json!({"id":1}), json!({"id":"9007199254740993"})]
+    );
+    tokio::fs::copy(dir.path().join(file), dir.path().join("single.lance"))
+      .await
+      .unwrap();
+    let single = page(storage, "single.lance", query(true)).await.unwrap();
+    assert_eq!(single.rows, physical.rows);
   }
   #[cfg(unix)]
   #[tokio::test]

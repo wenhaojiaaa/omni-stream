@@ -4852,6 +4852,8 @@ dependencies = [
  "http 1.4.0",
  "image",
  "lance",
+ "lance-encoding",
+ "lance-file",
  "lance-io",
  "mime_guess",
  "nu-ansi-term",
