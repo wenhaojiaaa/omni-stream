@@ -603,12 +603,12 @@ export function FileList() {
   const previewName = searchParams.get(PREVIEW_PARAM)
   const previewState = useMemo(() => {
     if (!previewName) return null
-    const kind = previewableKind(previewName)
+    const kind = previewableKind(previewName, serverInfo.data?.lance_enabled)
     if (!kind) return null
     const key = prefix + previewName
     const size = listQuery.data?.entries.find((entry) => entry.key === key)?.size
     return { key, kind, size }
-  }, [listQuery.data, previewName, prefix])
+  }, [listQuery.data, previewName, prefix, serverInfo.data?.lance_enabled])
 
   // Look up the entry currently being previewed so we can pass its
   // last_modified into the previewer as a cache buster. Falls back to null
@@ -952,8 +952,8 @@ export function FileList() {
   // page hasn't been fetched yet. Filters apply here too so arrow keys
   // skip over rows the user hid.
   const previewableEntries = useMemo(
-    () => filteredEntries.filter((e) => !e.is_dir && previewableKind(e.key)),
-    [filteredEntries],
+    () => filteredEntries.filter((e) => !e.is_dir || previewableKind(e.key, serverInfo.data?.lance_enabled) === 'lance'),
+    [filteredEntries, serverInfo.data?.lance_enabled],
   )
 
   const navigatePreview = useCallback(
@@ -975,7 +975,7 @@ export function FileList() {
   // sort direction.
   const handleEntry = useCallback(
     (entry: FileEntry) => {
-      if (entry.is_dir) {
+      if (entry.is_dir && previewableKind(entry.key, serverInfo.data?.lance_enabled) !== 'lance') {
         goToPath(entry.key)
         return
       }
@@ -985,7 +985,7 @@ export function FileList() {
       // formats the user'd rather just grab.
       openPreview(entry)
     },
-    [goToPath, openPreview],
+    [goToPath, openPreview, serverInfo.data?.lance_enabled],
   )
 
   // Split layout = list view with enough room for both panes. Measuring the
@@ -1946,7 +1946,7 @@ export function FileList() {
                     showInvisible={showInvisiblePathChars}
                   />
                 </span>
-                <div className="flex shrink-0 items-center gap-1">
+                {previewState!.kind !== 'lance' && <div className="flex shrink-0 items-center gap-1">
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
@@ -1987,7 +1987,7 @@ export function FileList() {
                     </TooltipTrigger>
                     <TooltipContent>Download</TooltipContent>
                   </Tooltip>
-                </div>
+                </div>}
               </div>
               <InlinePreview
                 fileKey={previewState!.key}

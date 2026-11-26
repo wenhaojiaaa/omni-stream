@@ -15,6 +15,7 @@
 - **3D models** — glb / gltf / obj / ply / stl / pcd / fbx with orbit, grid, and axis controls
   (FBX external textures must be embedded; GLTF sidecars are loaded from the same storage)
 - **NumPy arrays** — npy / npz metadata and sampled `(N, 3)` / `(N, 6)` point-cloud rendering
+- **Lance datasets** — click a `.lance/` directory on local or S3 storage to preview paginated rows, column types and numeric vectors. Build with `cargo build --release --features lance` and a protobuf compiler (`protoc`). Binary and unbounded nested columns display a placeholder.
 - **Safetensors weights** — header-only Tensor key / shape / dtype listing with stored-element counts and storage-size estimates; large weight data is never downloaded for the preview
 - **Anything else** — generic fallback: icon + metadata + the browser's built-in viewer
 
