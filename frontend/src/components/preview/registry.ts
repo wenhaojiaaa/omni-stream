@@ -149,7 +149,8 @@ export function previewTypeForKey(key: string): PreviewType | null {
 /// (file icon + metadata + optional iframe).
 export function previewableKind(key: string, lanceEnabled = false): PreviewKind | null {
   if (!key) return null
-  if (key.endsWith('/')) return lanceEnabled && /\.lance\/$/i.test(key) ? 'lance' : null
+  if (lanceEnabled && /\.lance\/?$/i.test(key)) return 'lance'
+  if (key.endsWith('/')) return null
   return previewTypeForKey(key)?.kind ?? 'generic'
 }
 

@@ -1946,7 +1946,7 @@ export function FileList() {
                     showInvisible={showInvisiblePathChars}
                   />
                 </span>
-                {previewState!.kind !== 'lance' && <div className="flex shrink-0 items-center gap-1">
+                {(previewState!.kind !== 'lance' || !previewState!.key.endsWith('/')) && <div className="flex shrink-0 items-center gap-1">
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button

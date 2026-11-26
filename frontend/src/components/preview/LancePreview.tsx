@@ -12,7 +12,8 @@ import { PageControls } from './PageControls'
 import type { PreviewerProps } from './types'
 
 interface Page {
-  version: number
+  version?: number
+  file_format?: string
   total: number
   offset: number
   columns: DataTableColumn[]
@@ -27,12 +28,13 @@ export function LancePreview(props: PreviewerProps) {
 
 function DatasetPage({ storage, fileKey }: PreviewerProps) {
   const [cursor, setCursor] = useState<{ page: number; version?: number }>({ page: 0 })
+  const physical = !fileKey.endsWith('/')
   const directory = `/s/${encodeURIComponent(storage ?? '')}/${encodeKey(fileKey)}/`
   const query = useQuery({
     queryKey: ['lance', storage, fileKey, cursor],
     queryFn: async ({ signal }) => {
       const { data } = await apiClient.get<Page>(`/api/lance/${encodeKey(fileKey)}`, {
-        params: { storage, offset: cursor.page * pageSize, version: cursor.version },
+        params: { storage, physical: physical || undefined, offset: cursor.page * pageSize, version: cursor.version },
         signal,
       })
       return data
@@ -48,10 +50,10 @@ function DatasetPage({ storage, fileKey }: PreviewerProps) {
       </div>
     )
   }
-  if (query.isError && query.error instanceof ApiError && query.error.isNotFound && !cursor.version) {
+  if (!physical && query.isError && query.error instanceof ApiError && query.error.isNotFound && !cursor.version) {
     return <Navigate replace to={directory} />
   }
-  const browse = (
+  const browse = !physical && (
     <Button asChild variant="outline" size="sm">
       <Link to={directory}>Browse directory</Link>
     </Button>
@@ -70,7 +72,9 @@ function DatasetPage({ storage, fileKey }: PreviewerProps) {
   return (
     <div className="flex min-h-0 w-full flex-col gap-2 overflow-auto p-2">
       <div className="flex flex-wrap items-center gap-2 text-sm">
-        <span>Lance · v{data.version} · {data.total.toLocaleString()} rows</span>
+        <span>{physical
+          ? `Lance file · format ${data.file_format} · ${data.total.toLocaleString()} physical rows`
+          : `Lance · v${data.version} · ${data.total.toLocaleString()} rows`}</span>
         {browse}
         {data.total > 0 && (
           <PageControls
