@@ -2,7 +2,7 @@
 use std::fmt;
 use std::sync::{
   Arc,
-  atomic::{AtomicU64, Ordering},
+  atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
@@ -26,6 +26,7 @@ pub(super) struct DatasetStore {
   backend: Arc<dyn StorageBackend>,
   root: String,
   remaining: Arc<AtomicU64>,
+  pub(super) read_limit_hit: Arc<AtomicBool>,
 }
 
 impl DatasetStore {
@@ -34,6 +35,7 @@ impl DatasetStore {
       backend,
       root: root.to_owned(),
       remaining: Arc::new(AtomicU64::new(REQUEST_BYTES)),
+      read_limit_hit: Default::default(),
     }
   }
 
@@ -148,7 +150,10 @@ impl ObjectStore for DatasetStore {
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
           n.checked_sub(length)
         })
-        .map_err(|_| failure("Lance preview read budget exceeded"))?;
+        .map_err(|_| {
+          self.read_limit_hit.store(true, Ordering::Relaxed);
+          failure("Lance preview read budget exceeded")
+        })?;
       let response = self
         .backend
         .get_file(

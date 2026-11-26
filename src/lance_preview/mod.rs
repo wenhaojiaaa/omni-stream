@@ -28,10 +28,11 @@ use tokio::sync::Semaphore;
 static READERS: Semaphore = Semaphore::const_new(4);
 const PAGE_ROWS: usize = 20;
 const DISPLAY_BYTES: usize = 4 << 20;
+const DISPLAY_LIMIT: &str = "The preview exceeds the 4 MiB display limit.";
 
 // Arrow string escaping and vector formatting can expand a small binary
 // batch considerably. Enforce the byte cap while constructing either JSON
-// representation, including schema and omitted-value placeholders.
+// representation, including the schema.
 #[derive(Default)]
 struct PageBuffer(Vec<u8>);
 
@@ -94,7 +95,13 @@ pub async fn handler(
     .map_err(|_| AppError::Busy("Lance previews are busy".into()))?;
   let page = page(backend, &key, query).await?;
   let mut output = PageBuffer::default();
-  serde_json::to_writer(&mut output, &page).map_err(|e| AppError::Unsupported(e.to_string()))?;
+  serde_json::to_writer(&mut output, &page).map_err(|e| {
+    if e.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
+      AppError::LancePageTooLarge(DISPLAY_LIMIT)
+    } else {
+      AppError::Unsupported(e.to_string())
+    }
+  })?;
   Ok(([(header::CONTENT_TYPE, "application/json")], output.0).into_response())
 }
 
@@ -149,26 +156,38 @@ async fn page(
     File(FileReader),
   }
   let store = Arc::new(store::DatasetStore::new(backend.clone(), root));
+  let read_error = |error| {
+    if store
+      .read_limit_hit
+      .load(std::sync::atomic::Ordering::Relaxed)
+    {
+      AppError::LancePageTooLarge("Reading this preview exceeds the 32 MiB storage read limit.")
+    } else {
+      dataset_error(error)
+    }
+  };
   let source = if query.physical {
     if query.version.is_some() {
       return Err(AppError::Unsupported(
         "physical files have no snapshot version".into(),
       ));
     }
+    backend.check_read_scope(root, root).await?;
+    let meta = backend.stat(root).await?;
     let virtual_uri =
       url::Url::parse("memory:///selected-file").map_err(|e| AppError::Backend(e.to_string()))?;
     let object_store = store
       .new_store(virtual_uri, &Default::default())
       .await
-      .map_err(dataset_error)?;
+      .map_err(read_error)?;
     let scheduler = ScanScheduler::new(Arc::new(object_store), SchedulerConfig::new(4 << 20));
     let file = scheduler
       .open_file(
         &object_store::path::Path::from("selected-file"),
-        &CachedFileSize::unknown(),
+        &CachedFileSize::new(meta.size),
       )
       .await
-      .map_err(dataset_error)?;
+      .map_err(read_error)?;
     let reader = FileReader::try_open(
       file,
       None,
@@ -180,7 +199,7 @@ async fn page(
       },
     )
     .await
-    .map_err(dataset_error)?;
+    .map_err(read_error)?;
     Source::File(reader)
   } else {
     // A missing versions directory identifies an ordinary folder. Preserve all
@@ -204,7 +223,7 @@ async fn page(
     if let Some(version) = query.version {
       builder = builder.with_version(version);
     }
-    let ds = builder.load().await.map_err(dataset_error)?;
+    let ds = builder.load().await.map_err(read_error)?;
     if !ds.manifest().base_paths.is_empty() {
       return Err(AppError::Unsupported("external Lance base paths".into()));
     }
@@ -220,7 +239,7 @@ async fn page(
     ),
     Source::Dataset(ds) => (
       ds.schema(),
-      ds.count_rows(None).await.map_err(dataset_error)?,
+      ds.count_rows(None).await.map_err(read_error)?,
       Some(ds.version().version),
       None,
     ),
@@ -251,7 +270,7 @@ async fn page(
     let mut batches = match &source {
       Source::Dataset(ds) => {
         let indices = range.map(|i| i as u64).collect::<Vec<_>>();
-        let batch = ds.take(&indices, projection).await.map_err(dataset_error)?;
+        let batch = ds.take(&indices, projection).await.map_err(read_error)?;
         stream::once(async { Ok(batch) }).boxed()
       }
       Source::File(f) => {
@@ -262,7 +281,7 @@ async fn page(
           .collect::<Vec<_>>();
         let projection =
           lance_file::versions::reader_projection_from_column_names(f.version(), schema, &names)
-            .map_err(dataset_error)?;
+            .map_err(read_error)?;
         f.read_stream_projected(
           ReadBatchParams::Range(range),
           limit as u32,
@@ -271,34 +290,32 @@ async fn page(
           lance_encoding::decoder::FilterExpression::no_filter(),
         )
         .await
-        .map_err(dataset_error)?
-        .map_err(|e| AppError::Unsupported(e.to_string()))
+        .map_err(read_error)?
+        .map_err(read_error)
         .boxed()
       }
     };
     let mut writer = arrow_json::ArrayWriter::new(PageBuffer::default());
+    let write_error = |e: arrow_schema::ArrowError| match e {
+      arrow_schema::ArrowError::IoError(_, cause)
+        if cause.kind() == io::ErrorKind::FileTooLarge =>
+      {
+        AppError::LancePageTooLarge(DISPLAY_LIMIT)
+      }
+      other => AppError::Unsupported(other.to_string()),
+    };
     while let Some(batch) = batches.try_next().await? {
       if batch.get_array_memory_size() > DISPLAY_BYTES {
-        return Err(AppError::Unsupported(
-          "Lance page exceeds the display budget".into(),
-        ));
+        return Err(AppError::LancePageTooLarge(DISPLAY_LIMIT));
       }
-      writer
-        .write(&batch)
-        .map_err(|e| AppError::Unsupported(e.to_string()))?;
+      writer.write(&batch).map_err(write_error)?;
     }
-    writer
-      .finish()
-      .map_err(|e| AppError::Unsupported(e.to_string()))?;
+    writer.finish().map_err(write_error)?;
     serde_json::from_slice(&writer.into_inner().0).map_err(|e| AppError::Backend(e.to_string()))?
   };
   for row in &mut rows {
-    for col in &columns {
-      if col.omitted {
-        row[&col.name] = json!("(value omitted)");
-      } else if let Some(value) = row.get_mut(&col.name) {
-        preserve_integer_precision(value);
-      }
+    if let Some(fields) = row.as_object_mut() {
+      fields.values_mut().for_each(preserve_integer_precision);
     }
   }
   tracing::debug!(
@@ -339,8 +356,10 @@ mod tests {
     use crate::storage::local::LocalFsBackend;
     let dir = tempfile::tempdir().unwrap();
     let dataset = dir.path().join("fixture.lance");
-    let schema =
-      arrow_schema::Schema::new(vec![arrow_schema::Field::new("id", DataType::Int64, false)]);
+    let schema = arrow_schema::Schema::new(vec![
+      arrow_schema::Field::new("id", DataType::Int64, false),
+      arrow_schema::Field::new("payload", DataType::Binary, true),
+    ]);
     let reader = arrow_json::ReaderBuilder::new(Arc::new(schema))
       .build(std::io::Cursor::new(
         b"{\"id\":1}\n{\"id\":9007199254740993}\n",
@@ -360,6 +379,7 @@ mod tests {
     let result = page(storage.clone(), "fixture.lance/", query)
       .await
       .unwrap();
+    assert!(result.columns[1].omitted);
     assert_eq!(result.total, 2);
     assert_eq!(result.rows, vec![json!({"id":"9007199254740993"})]);
     let file = format!(
@@ -388,11 +408,30 @@ mod tests {
       physical.rows,
       vec![json!({"id":1}), json!({"id":"9007199254740993"})]
     );
-    tokio::fs::copy(dir.path().join(file), dir.path().join("single.lance"))
+    tokio::fs::copy(dir.path().join(&file), dir.path().join("single.lance"))
       .await
       .unwrap();
-    let single = page(storage, "single.lance", query(true)).await.unwrap();
+    let single = page(storage.clone(), "single.lance", query(true))
+      .await
+      .unwrap();
     assert_eq!(single.rows, physical.rows);
+
+    tokio::fs::remove_file(dir.path().join(&file))
+      .await
+      .unwrap();
+    let missing_file = page(storage.clone(), &file, query(true))
+      .await
+      .err()
+      .unwrap();
+    assert_eq!(
+      missing_file.into_response().status(),
+      axum::http::StatusCode::NOT_FOUND
+    );
+    let broken_dataset = page(storage, "fixture.lance", query(false))
+      .await
+      .err()
+      .unwrap();
+    assert!(matches!(broken_dataset, AppError::InvalidModel(_)));
   }
   #[cfg(unix)]
   #[tokio::test]

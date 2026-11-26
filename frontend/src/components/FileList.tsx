@@ -600,15 +600,18 @@ export function FileList() {
     setTypeFilter('')
   }, [prefix])
 
+  const inLanceDataset = previewableKind(prefix, serverInfo.data?.lance_enabled) === 'lance'
   const previewName = searchParams.get(PREVIEW_PARAM)
   const previewState = useMemo(() => {
     if (!previewName) return null
-    const kind = previewableKind(previewName, serverInfo.data?.lance_enabled)
+    // "." previews the open dataset alongside its own directory listing.
+    if (previewName === '.' && !inLanceDataset) return null
+    const key = previewName === '.' ? prefix : prefix + previewName
+    const kind = previewableKind(key, serverInfo.data?.lance_enabled)
     if (!kind) return null
-    const key = prefix + previewName
     const size = listQuery.data?.entries.find((entry) => entry.key === key)?.size
     return { key, kind, size }
-  }, [listQuery.data, previewName, prefix, serverInfo.data?.lance_enabled])
+  }, [inLanceDataset, listQuery.data, previewName, prefix, serverInfo.data?.lance_enabled])
 
   // Look up the entry currently being previewed so we can pass its
   // last_modified into the previewer as a cache buster. Falls back to null
@@ -952,8 +955,8 @@ export function FileList() {
   // page hasn't been fetched yet. Filters apply here too so arrow keys
   // skip over rows the user hid.
   const previewableEntries = useMemo(
-    () => filteredEntries.filter((e) => !e.is_dir || previewableKind(e.key, serverInfo.data?.lance_enabled) === 'lance'),
-    [filteredEntries, serverInfo.data?.lance_enabled],
+    () => filteredEntries.filter((entry) => !entry.is_dir),
+    [filteredEntries],
   )
 
   const navigatePreview = useCallback(
@@ -975,7 +978,7 @@ export function FileList() {
   // sort direction.
   const handleEntry = useCallback(
     (entry: FileEntry) => {
-      if (entry.is_dir && previewableKind(entry.key, serverInfo.data?.lance_enabled) !== 'lance') {
+      if (entry.is_dir) {
         goToPath(entry.key)
         return
       }
@@ -985,7 +988,7 @@ export function FileList() {
       // formats the user'd rather just grab.
       openPreview(entry)
     },
-    [goToPath, openPreview, serverInfo.data?.lance_enabled],
+    [goToPath, openPreview],
   )
 
   // Split layout = list view with enough room for both panes. Measuring the
@@ -1494,6 +1497,20 @@ export function FileList() {
               <PathNavigator prefix={prefix} activeStorage={activeStorage} onNavigate={goToPathOrFile} />
             </div>
             <div className="flex w-full shrink-0 flex-wrap items-center justify-between gap-2 @5xl/file-list:w-auto @5xl/file-list:justify-start">
+              {inLanceDataset && previewState?.key !== prefix && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSearchParams((prev) => {
+                    const next = new URLSearchParams(prev)
+                    next.set(PREVIEW_PARAM, '.')
+                    return next
+                  })}
+                >
+                  <Eye className="size-4" />
+                  Preview dataset
+                </Button>
+              )}
               {/* Sort dropdown — field selector (name/size/mtime/type) and
                   direction toggle. The dropdown is compact so it doesn't
                   crowd the toolbar on narrow viewports. */}

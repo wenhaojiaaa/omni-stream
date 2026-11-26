@@ -1,8 +1,10 @@
 import { useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { Link, Navigate } from 'react-router-dom'
+import { Link, Navigate, useSearchParams } from 'react-router-dom'
 
 import { apiClient, ApiError } from '@/api/client'
+import { getSidebarEntryRoute } from '@/lib/route-path'
+import { readLancePage, type LanceCursor } from '@/lib/lance-page'
 import { encodeKey } from '@/lib/path'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -20,25 +22,27 @@ interface Page {
   rows: Record<string, unknown>[]
 }
 
-const pageSize = 20
-
 export function LancePreview(props: PreviewerProps) {
   return <DatasetPage key={JSON.stringify([props.storage, props.fileKey])} {...props} />
 }
 
 function DatasetPage({ storage, fileKey }: PreviewerProps) {
-  const [cursor, setCursor] = useState<{ page: number; version?: number }>({ page: 0 })
+  const [cursor, setCursor] = useState<LanceCursor>({ offset: 0, limit: 10 })
   const physical = !fileKey.endsWith('/')
-  const directory = `/s/${encodeURIComponent(storage ?? '')}/${encodeKey(fileKey)}/`
+  const [searchParams] = useSearchParams()
+  const directory = getSidebarEntryRoute(
+    { storage: storage ?? '', key: fileKey, type: 'folder' },
+    searchParams.get('view') ?? undefined,
+  )
   const query = useQuery({
     queryKey: ['lance', storage, fileKey, cursor],
-    queryFn: async ({ signal }) => {
+    queryFn: ({ signal }) => readLancePage(cursor, async (offset, limit) => {
       const { data } = await apiClient.get<Page>(`/api/lance/${encodeKey(fileKey)}`, {
-        params: { storage, physical: physical || undefined, offset: cursor.page * pageSize, version: cursor.version },
+        params: { storage, physical: physical || undefined, offset, limit, version: cursor.version },
         signal,
       })
       return data
-    },
+    }),
     placeholderData: keepPreviousData,
     retry: false,
     refetchOnWindowFocus: false,
@@ -67,8 +71,10 @@ function DatasetPage({ storage, fileKey }: PreviewerProps) {
       </Alert>
     )
   }
-  const data = query.data
-  const jump = (page: number) => setCursor({ page, version: data.version })
+  const { data, limit } = query.data
+  const pageIndex = data.offset / limit
+  const jump = (page: number, backwards = false) =>
+    setCursor({ offset: page * limit, limit, version: data.version, backwards })
   return (
     <div className="flex min-h-0 w-full flex-col gap-2 overflow-auto p-2">
       <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -78,13 +84,13 @@ function DatasetPage({ storage, fileKey }: PreviewerProps) {
         {browse}
         {data.total > 0 && (
           <PageControls
-            pageIndex={cursor.page}
-            pageCount={Math.ceil(data.total / pageSize)}
+            pageIndex={pageIndex}
+            pageCount={Math.ceil(data.total / limit)}
             hasMore={data.offset + data.rows.length < data.total}
             loading={query.isFetching}
             showLoadingStatus
-            onPrev={() => jump(cursor.page - 1)}
-            onNext={() => jump(cursor.page + 1)}
+            onPrev={() => jump(pageIndex - 1, true)}
+            onNext={() => jump(pageIndex + 1)}
             onJump={jump}
           />
         )}
@@ -93,8 +99,8 @@ function DatasetPage({ storage, fileKey }: PreviewerProps) {
         columns={data.columns}
         rows={data.rows}
         loading={false}
-        pageIndex={data.offset / pageSize}
-        pageSize={pageSize}
+        pageIndex={pageIndex}
+        pageSize={limit}
       />
     </div>
   )
